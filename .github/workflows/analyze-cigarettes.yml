@@ -23,11 +23,9 @@ jobs:
   analyze:
     runs-on: ubuntu-latest
     steps:
-      # 1. 检出代码（fetch-depth: 0 以便对比历史）
+      # 1. 检出代码（完整历史，便于排查）
       - name: 检出仓库
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 2
 
       # 2. 配置 Python 环境
       - name: 配置 Python
@@ -42,43 +40,66 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # 4. 确定要分析的文件列表
-      - name: 确定待分析文件
-        id: files
+      # 4. 查找待分析的 xlsx 文件
+      #    策略：直接递归查找 data/ 下所有 xlsx。
+      #    因为 JSON 文件名含投放日期，重复分析同一文件只会覆盖同名 JSON（幂等），
+      #    每周仅 1-2 个文件，全量分析开销可忽略，但避免了 git diff 路径匹配的坑。
+      - name: 查找待分析文件
         run: |
           mkdir -p output
           if [ -n "${{ github.event.inputs.file }}" ]; then
             # 手动触发：指定单个文件
             echo "data/${{ github.event.inputs.file }}" > changed_files.txt
           else
-            # push 触发：对比本次推送变更的 xlsx 文件
-            # 若对比失败（如首次提交），则分析 data/ 下所有 xlsx
-            git diff --name-only HEAD~1 HEAD -- 'data/*.xlsx' > changed_files.txt 2>/dev/null || true
-            if [ ! -s changed_files.txt ]; then
-              echo "未检测到 git diff 变更，分析 data/ 下所有 xlsx"
-              find data -name '*.xlsx' -type f > changed_files.txt
-            fi
+            # 递归查找 data/ 下所有 xlsx
+            find data -name '*.xlsx' -type f > changed_files.txt
           fi
           echo "=== 待分析文件 ==="
           cat changed_files.txt
+          echo "=== 文件数量: $(wc -l < changed_files.txt) ==="
+          if [ ! -s changed_files.txt ]; then
+            echo "::error::data/ 目录下没有找到任何 xlsx 文件，请确认文件已上传到 data/ 目录"
+            exit 1
+          fi
 
-      # 5. 逐个分析 xlsx 文件
+      # 5. 逐个分析 xlsx 文件，统计成功/失败
       - name: 分析 xlsx 并生成 JSON
         run: |
+          success=0
+          failed=0
           while IFS= read -r f; do
             [ -z "$f" ] && continue
-            [ ! -f "$f" ] && echo "跳过（文件不存在）: $f" && continue
             echo "=========================================="
             echo "分析: $f"
-            python scripts/cigarette_parser.py --input "$f" --output-dir output/
+            if [ ! -f "$f" ]; then
+              echo "::warning::文件不存在: $f"
+              failed=$((failed+1))
+              continue
+            fi
+            if python scripts/cigarette_parser.py --input "$f" --output-dir output/; then
+              success=$((success+1))
+            else
+              echo "::warning::解析失败: $f"
+              failed=$((failed+1))
+            fi
           done < changed_files.txt
+          echo "=========================================="
+          echo "解析完成：成功 $success 个，失败 $failed 个"
+          if [ "$success" -eq 0 ]; then
+            echo "::error::没有成功解析任何文件，请检查 xlsx 格式或查看上方日志"
+            exit 1
+          fi
+          echo "=== output 目录内容 ==="
+          ls -la output/
 
       # 6. 提交并推送生成的 JSON
+      #    用 git add output/ 整目录添加，避免 glob 无匹配时报错；
+      #    再用 git diff --cached 判断是否有变更需要提交。
       - name: 提交 JSON 结果
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add output/*.json
+          git add output/
           if git diff --cached --quiet; then
             echo "没有新的 JSON 需要提交"
           else
@@ -92,4 +113,5 @@ jobs:
         with:
           name: cigarette-json-${{ github.run_number }}
           path: output/*.json
+          if-no-files-found: warn
           retention-days: 90
