@@ -1,0 +1,95 @@
+name: 分析卷烟投放策略
+
+# ============================================================
+# 触发条件：
+#   1. 当 data/ 目录下的 xlsx 文件发生变更（新增/修改/删除）时自动触发
+#   2. 支持手动触发（workflow_dispatch），便于调试
+# ============================================================
+on:
+  push:
+    paths:
+      - 'data/**/*.xlsx'
+  workflow_dispatch:
+    inputs:
+      file:
+        description: '指定要分析的 xlsx 文件名（留空则分析 data/ 下所有 xlsx）'
+        required: false
+        default: ''
+
+permissions:
+  contents: write   # 允许工作流提交 JSON 回仓库
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    steps:
+      # 1. 检出代码（fetch-depth: 0 以便对比历史）
+      - name: 检出仓库
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      # 2. 配置 Python 环境
+      - name: 配置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      # 3. 安装依赖
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # 4. 确定要分析的文件列表
+      - name: 确定待分析文件
+        id: files
+        run: |
+          mkdir -p output
+          if [ -n "${{ github.event.inputs.file }}" ]; then
+            # 手动触发：指定单个文件
+            echo "data/${{ github.event.inputs.file }}" > changed_files.txt
+          else
+            # push 触发：对比本次推送变更的 xlsx 文件
+            # 若对比失败（如首次提交），则分析 data/ 下所有 xlsx
+            git diff --name-only HEAD~1 HEAD -- 'data/*.xlsx' > changed_files.txt 2>/dev/null || true
+            if [ ! -s changed_files.txt ]; then
+              echo "未检测到 git diff 变更，分析 data/ 下所有 xlsx"
+              find data -name '*.xlsx' -type f > changed_files.txt
+            fi
+          fi
+          echo "=== 待分析文件 ==="
+          cat changed_files.txt
+
+      # 5. 逐个分析 xlsx 文件
+      - name: 分析 xlsx 并生成 JSON
+        run: |
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            [ ! -f "$f" ] && echo "跳过（文件不存在）: $f" && continue
+            echo "=========================================="
+            echo "分析: $f"
+            python scripts/cigarette_parser.py --input "$f" --output-dir output/
+          done < changed_files.txt
+
+      # 6. 提交并推送生成的 JSON
+      - name: 提交 JSON 结果
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add output/*.json
+          if git diff --cached --quiet; then
+            echo "没有新的 JSON 需要提交"
+          else
+            git commit -m "chore: 自动生成卷烟投放策略 JSON [skip ci]"
+            git push
+          fi
+
+      # 7. 上传 JSON 为构建产物（便于下载查看，保留 90 天）
+      - name: 上传 JSON 产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: cigarette-json-${{ github.run_number }}
+          path: output/*.json
+          retention-days: 90
